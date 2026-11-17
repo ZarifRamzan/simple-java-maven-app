@@ -1,0 +1,151 @@
+name: CI
+
+# Pipeline stages: Validate (format + lint) -> Test -> Security (SAST + dep/secret scan)
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run that is still in flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+
+jobs:
+  # ---------------------------------------------------------------- 1. VALIDATE
+  validate:
+    name: Validate - format & lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      # Fails if any source file is not formatted the way google-java-format
+      # would format it. Fix locally with: mvn -B spotless:apply
+      - name: Format check (Spotless / google-java-format)
+        run: mvn -B -ntp spotless:check
+
+      # Static analysis of the source itself (style, naming, javadoc, bugs).
+      - name: Lint (Checkstyle google_checks)
+        run: mvn -B -ntp checkstyle:check
+
+      # Guards the build floor declared in pom.xml (Maven >= 3.9.9, JDK >= 21).
+      - name: Toolchain guard (Maven Enforcer)
+        run: mvn -B -ntp enforcer:enforce
+
+  # -------------------------------------------------------------------- 2. TEST
+  test:
+    name: Test - JDK ${{ matrix.java }}
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Build and run tests
+        run: mvn -B -ntp clean verify
+
+      # Keep the JUnit XML even when the build fails - that is when you need it.
+      - name: Upload JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-jdk${{ matrix.java }}
+          path: target/surefire-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload executable jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-app-jar
+          path: target/my-app-*.jar
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------- 3. SECURITY
+  security:
+    name: Security - CodeQL + dependency/secret scan
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      security-events: write   # required to upload SARIF into the Security tab
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java-kotlin
+          queries: security-extended
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      # CodeQL traces this build to learn what the program actually does.
+      - name: Build for analysis
+        run: mvn -B -ntp -DskipTests clean package
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:java-kotlin
+
+      # Scans dependencies (pom.xml), secrets accidentally committed, and
+      # misconfiguration. Findings land in the repo's Security tab.
+      # To make CVEs BLOCKING instead of advisory, set exit-code to '1'.
+      - name: Scan dependencies & secrets (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,config
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy results to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
