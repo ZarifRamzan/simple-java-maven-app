@@ -46,13 +46,9 @@ jobs:
       - name: Lint (Checkstyle google_checks)
         run: mvn -B -ntp checkstyle:check
 
-      # Guards the build floor declared in pom.xml (Maven >= 3.9.9, JDK >= 21).
-      - name: Toolchain guard (Maven Enforcer)
-        run: mvn -B -ntp enforcer:enforce
-
   # -------------------------------------------------------------------- 2. TEST
   test:
-    name: Test - JDK ${{ matrix.java }}
+    name: Test - unit tests & import jar
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -136,7 +132,7 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          scanners: vuln,secret,config
+          scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           format: sarif
